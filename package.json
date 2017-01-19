@@ -1,0 +1,22 @@
+{
+  "name": "jsonp-namespace-plugin",
+  "version": "0.0.1",
+  "description": "support namespace for webpackJsonp callback",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/inferpse/jsonp-namespace-plugin.git"
+  },
+  "author": "inferpse",
+  "license": "MIT",
+  "bugs": {
+    "url": "https://github.com/inferpse/jsonp-namespace-plugin/issues"
+  },
+  "homepage": "https://github.com/inferpse/jsonp-namespace-plugin#readme",
+  "dependencies": {
+    "webpack-sources": "^0.1.2"
+  }
+}
