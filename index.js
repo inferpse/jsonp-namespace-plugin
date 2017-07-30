@@ -1,62 +1,188 @@
-var RawSource = require('webpack-sources').RawSource;
+const { SourceMapSource, RawSource } = require('webpack-sources'),
+      babel = require('babel-core');
 
-var getJsonpNsFunction = 'var getJsonpNsFunction = function(name) { var parts = name.split("."), result = window; for (var i = 0; i < parts.length; i++) { if (result) { result = result[parts[i]]; } } return result; }',
-    getJsonpNsObject = 'var getJsonpNsObject = function(name) { var parts = name.split("."), result = window; for (var i = 0; i < parts.length - 1; i++) { var part = parts[i]; result = result[part] = result[part] || {} } return result; };';
+class JSONPNamespacePlugin {
+  constructor(options) {
+    this.options = Object.assign({
+      jsregex: /\.js($|\?)/i
+    }, options);
+  }
+  apply(compiler) {
+    const { options } = this,
+          { jsregex } = options,
+          useSourceMap = typeof options.sourceMap === 'undefined' ? !!compiler.options.devtool : options.sourceMap;
 
+    compiler.plugin('compilation', function (compilation) {
 
-function JsonpNamespacePlugin(options) {
-  this.options = options || {};
+      if (useSourceMap) {
+        compilation.plugin('build-module', function (module) {
+          module.useSourceMap = true;
+        });
+      }
+
+      compilation.plugin('optimize-chunk-assets', function (chunks, callback) {
+        const files = [];
+
+        chunks.forEach(chunk => {
+          chunk.files.forEach(file => files.push(file));
+        });
+
+        compilation.additionalChunkAssets.forEach(file => files.push(file));
+
+        files.filter(file => jsregex.test(file)).forEach(file => {
+          try {
+            let asset = compilation.assets[file];
+
+            // use cached asset
+            if (asset.__jsonpnsApplied) {
+              compilation.assets[file] = asset.__jsonpnsApplied;
+              return;
+            }
+
+            // read options
+            let input, inputSourceMap;
+            if (useSourceMap) {
+              if (asset.sourceAndMap) {
+                let sourceAndMap = asset.sourceAndMap();
+                inputSourceMap = sourceAndMap.map;
+                input = sourceAndMap.source;
+              } else {
+                inputSourceMap = asset.map();
+                input = asset.source();
+              }
+            } else {
+              input = asset.source();
+            }
+
+            // apply transformation
+            const result = babel.transform(input, {
+              plugins: [
+                [TransformWebpackJSONP, options]
+              ],
+              sourceMaps: useSourceMap,
+              compact: false,
+              babelrc: false,
+              inputSourceMap
+            });
+
+            // save result
+            asset.__jsonpnsApplied = compilation.assets[file] = (
+              result.map
+              ? new SourceMapSource(result.code, file, result.map, input, inputSourceMap)
+              : new RawSource(result.code)
+            );
+          } catch (e) {
+            compilation.errors.push(e);
+          }
+        });
+
+        callback();
+      })
+    });
+  }
 }
 
-JsonpNamespacePlugin.prototype.apply = function(compiler) {
-  var options = this.options;
-  var jsregex = options.test || /\.js($|\?)/i;
-
-  compiler.plugin('compilation', function (compilation) {
-    compilation.plugin('optimize-chunk-assets', function (chunks, callback) {
-      const files = [];
-
-      chunks.forEach(function(chunk) {
-        chunk.files.forEach(function(file) {
-          files.push(file);
-        });
-      });
-
-      compilation.additionalChunkAssets.forEach(function(file) {
-        files.push(file);
-      });
-
-      files.filter(function(file) {
-        return jsregex.test(file);
-      }).forEach(function(file) {
-        try {
-          var asset = compilation.assets[file];
-
-          // return cached version
-          if (asset.__nsapplied) {
-            compilation.assets[file] = asset.__nsapplied;
-            return;
+const TransformWebpackJSONP = ({types: t}) => {
+  return {
+    visitor: {
+      Identifier: (path, {opts: options}) => {
+        const { parentPath } = path;
+        if (isWebpackJSONPVariableDeclaration(path)) {
+          if (!isVariableDeclarationReplaced(path)) {
+            let ns = parentPath.node.init.property.value;
+            if (ns.indexOf('.') > -1) {
+              // replace "var parentJsonpFunction = window[...]" with "var parentJsonpFunction = window.*** && window.***.***"
+              parentPath.replaceWith(t.variableDeclarator(t.identifier('parentJsonpFunction'), generateSafeAccessor(t, `window.${ns}`)));
+            }
           }
+        } else if (isWebpackCallbackFunctionDefinition(path)) {
+          if (!isPreparationCodeInserted(path)) {
+            let assignmentPath = parentPath.parentPath,
+                ns = assignmentPath.node.left.property.value;
 
-          // grab source input
-          var input = asset.source();
+            if (ns.indexOf('.') > -1) {
+              // add code to prepare namespace (if it does not exist)
+              const replacements = [],
+                    nsPath = `window.${ns}`,
+                    nsParts = nsPath.split('.');
 
-          // replace define and requires
-          var result = input
-                .replace(/(.*?)(var parentJsonpFunction =)/, ('$1' + getJsonpNsFunction + '\n') + ('$1' + getJsonpNsObject + '\n') + '$1$2')
-                .replace(/var parentJsonpFunction = window\["(.*?)"\]/, 'var parentJsonpFunction = getJsonpNsFunction("$1")')
-                .replace(/window\["((?:.*\.)(.*))"\] = function webpackJsonpCallback/, 'getJsonpNsObject("$1")["$2"] = function webpackJsonpCallback');
+              // debugger;
+              for (let i = 2; i < nsParts.length; i++) {
+                replacements.push(
+                  generateNsInitializer(t, nsParts.slice(0, i).join('.'))
+                )
+              }
 
-          // save result
-          asset.__nsapplied = compilation.assets[file] = new RawSource(result);
-        } catch(e) {
-          compilation.errors.push(e);
+              // replace "window['test.namespace'] = function webpackJsonpCallback" with "window.test.namespace = function webpackJsonpCallback"
+              replacements.push(
+                t.AssignmentExpression('=', generateObjectIdentifier(t, `window.${ns}`), assignmentPath.node.right)
+              );
+
+              assignmentPath.replaceWithMultiple(replacements);
+            }
+          }
         }
-      });
+      }
+    }
+  };
 
-      callback();
-    });
-  });
-};
+  function isWebpackJSONPVariableDeclaration(path) {
+    const { node, parentPath } = path;
+    return node.name === 'parentJsonpFunction' && parentPath.isVariableDeclarator();
+  }
 
-module.exports = JsonpNamespacePlugin;
+  function isVariableDeclarationReplaced(path) {
+    const { node, parentPath } = path;
+    return !(parentPath.node.init.type === 'MemberExpression' && parentPath.node.init.computed)
+  }
+
+  function isWebpackCallbackFunctionDefinition(path) {
+    const { node, parentPath } = path;
+    return node.name === 'webpackJsonpCallback' && parentPath.isFunctionExpression();
+  }
+
+  function isPreparationCodeInserted(path) {
+    const assignmentPath = path.parentPath.parentPath;
+    return !(assignmentPath.isAssignmentExpression() && assignmentPath.node.left.computed);
+  }
+
+  function generateObjectIdentifier(t, objStr) {
+    const propList = objStr.split('.'),
+          objName = propList.slice(0, propList.length - 1).join('.'),
+          propName = propList[propList.length - 1];
+
+    if (propList.length > 1) {
+      return t.memberExpression(
+        generateObjectIdentifier(t, objName),
+        t.identifier(propName)
+      );
+    } else {
+      return t.identifier(objStr);
+    }
+  }
+
+  function generateSafeAccessor(t, objStr) {
+    const propList = objStr.split('.'),
+          prevObj = propList.slice(0, propList.length - 1).join('.');
+
+    if (propList.length > 2) {
+      return t.logicalExpression('&&', generateSafeAccessor(t, prevObj), generateObjectIdentifier(t, objStr));
+    } else {
+      return generateObjectIdentifier(t, objStr); 
+    }
+  }
+
+  function generateNsInitializer(t, objStr) {
+    return t.expressionStatement(
+      t.assignmentExpression('=', 
+        generateObjectIdentifier(t, objStr),
+        t.logicalExpression('||',
+          generateObjectIdentifier(t, objStr),
+          t.objectExpression([])
+        )
+      )
+    )
+  }
+}
+
+module.exports = JSONPNamespacePlugin;
