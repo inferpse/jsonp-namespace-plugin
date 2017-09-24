@@ -12,12 +12,16 @@ class JSONPNamespacePlugin {
           return index < array.length - 1 ? `window.${prop} = window.${prop} || {};` : ``;
         }).filter(str => str.length).join('\n');
 
-        // prepend namespace initialization code and replace original template parts
-        return this.asString([
-          initializeNS,
-          source.split(defaultTemplate).join(desiredNamespace)
-        ]);
-
+        if (source.indexOf('webpackJsonpCallback') < 0) {
+          // do not introduce namespace for entry points without dynamic chunk loading
+          return source;
+        } else {
+          // prepend namespace initialization code and replace original template parts
+          return this.asString([
+            initializeNS,
+            source.split(defaultTemplate).join(desiredNamespace)
+          ]);
+        }
       });
     });
   }
